@@ -372,18 +372,21 @@ cmd_watch() {
     while IFS= read -r r; do dirs+=("$r"); done < <(roots)
     cmd_wrap --quiet
     if [ -z "${AI_ALIGNED_CHROME_POLL:-}" ] && bin="$(helper)"; then
-        local fifo hp
-        fifo="$(mktemp -u "$STATE/watch.XXXXXX")" && mkfifo "$fifo" || return 1
-        "$bin" "${dirs[@]}" >"$fifo" & hp=$!
+        # Globals, not locals: the EXIT trap runs after this function returns.
+        WATCH_FIFO="$(mktemp -u "$STATE/watch.XXXXXX")" && mkfifo "$WATCH_FIFO" || return 1
+        "$bin" "${dirs[@]}" >"$WATCH_FIFO" & WATCH_HELPER=$!
         # The helper would outlive us otherwise: nothing writes to it until
         # the next event, so it would not even get SIGPIPE.
-        trap 'kill "$hp" 2>/dev/null; rm -f "$fifo"' EXIT
+        trap 'kill "${WATCH_HELPER:-}" 2>/dev/null; rm -f "${WATCH_FIFO:-}"' EXIT
         trap 'exit 143' TERM INT HUP
-        log "watch started (pid $$, fsevents helper $hp)"
-        while IFS= read -r -t 60 line || [ $? -gt 128 ]; do
+        log "watch started (pid $$, fsevents helper $WATCH_HELPER)"
+        # bash 3.2 returns 1 both on timeout and on EOF, so tell them apart by
+        # whether the helper is still alive.
+        while IFS= read -r -t 60 line || kill -0 "$WATCH_HELPER" 2>/dev/null; do
             [ "$line" = ready ] && log "watch ready"
+            line=""
             cmd_wrap --quiet
-        done <"$fifo"
+        done <"$WATCH_FIFO"
         log "watch: fsevents helper exited"
         return 1
     fi
