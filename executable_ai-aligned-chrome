@@ -1,0 +1,544 @@
+#!/bin/bash
+#
+# ai-aligned-chrome - keep test browsers out of the login keychain
+#
+# Chrome for Testing and Playwright/Puppeteer Chromium builds are ad-hoc
+# signed, so every build has a new identity (cdhash) as far as the keychain is
+# concerned. Each time a harness launches one *without* --use-mock-keychain,
+# the browser asks for "Chromium Safe Storage" and macOS shows a password
+# prompt. Nobody answers it while agents run tests, and while it is up every
+# other keychain client (gh, git credential helpers, bb) queues behind it.
+#
+# Harnesses that spawn the browser by absolute path cannot be fixed with a PATH
+# shim, and an "allow all applications" ACL does not help either: the item's
+# partition list is checked per cdhash. So this tool goes to the one place
+# every launcher passes through - the bundle's main executable - and replaces
+# it with a small launcher that adds --use-mock-keychain and
+# --password-store=basic whenever the profile is a throwaway one (its
+# --user-data-dir is under a temp directory). Persistent profiles, and launches
+# without --user-data-dir, are passed through untouched, so a profile that
+# relies on the real keychain keeps working.
+#
+# Usage: ai-aligned-chrome <command> [args]
+#
+#   wrap [APP...]       Wrap every unwrapped test browser under the cache roots
+#                       (or just the APPs given)
+#   unwrap [APP...]     Restore the original executables
+#   status              List test browsers and whether each is wrapped
+#   prompts [--last T]  Keychain prompts raised by test browsers (default 24h),
+#                       with the process that launched them if it is alive
+#   watch               Wrap new downloads as they appear (used by the agent)
+#   agent install|uninstall|status
+#                       Manage the LaunchAgent that runs `watch`
+#   doctor              Check the installation
+#   launcher            Print the launcher script that wrap installs
+#
+# Environment:
+#   AI_ALIGNED_CHROME_ROOTS     colon-separated cache roots to scan (replaces
+#                               the defaults)
+#   AI_ALIGNED_CHROME_HOME      state directory (default ~/.ai-aligned-chrome)
+#   AI_ALIGNED_CHROME_POLL      watch by polling instead of FSEvents
+#   AI_ALIGNED_CHROME_INTERVAL  polling interval in seconds (default 2)
+#   AI_ALIGNED_CHROME_DISABLE   set in a launch environment to skip injection
+
+set -uo pipefail
+
+VERSION="1"
+MARKER="# ai-aligned-chrome launcher v$VERSION"
+LABEL="com.ai-ecoverse.ai-aligned-chrome"
+STATE="${AI_ALIGNED_CHROME_HOME:-$HOME/.ai-aligned-chrome}"
+PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
+BUNDLE_IDS="com.google.chrome.for.testing org.chromium.Chromium"
+
+default_roots() {
+    printf '%s\n' \
+        "$HOME/Library/Caches/slicc-cdp/browsers" \
+        "$HOME/Library/Caches/ms-playwright" \
+        "$HOME/Library/Caches/puppeteer" \
+        "$HOME/.cache/puppeteer" \
+        "$HOME/.cache/selenium" \
+        "$HOME/.cache/slicc-cft"
+}
+
+roots() {
+    if [ -n "${AI_ALIGNED_CHROME_ROOTS:-}" ]; then
+        printf '%s\n' "$AI_ALIGNED_CHROME_ROOTS" | tr ':' '\n' | sed '/^$/d'
+    else
+        default_roots
+    fi
+}
+
+say()  { printf '%s\n' "$*"; }
+err()  { printf 'ai-aligned-chrome: %s\n' "$*" >&2; }
+log()  { mkdir -p "$STATE" 2>/dev/null && printf '%s %s\n' "$(date '+%Y-%m-%dT%H:%M:%S')" "$*" >>"$STATE/wrap.log"; }
+
+# --- the launcher ------------------------------------------------------------
+
+# The script that takes the place of Contents/MacOS/<executable>. It must run
+# on the stock /bin/bash 3.2 and must never fail closed: if anything about the
+# arguments is odd, it execs the real browser with them unchanged.
+launcher() {
+    cat <<'LAUNCHER'
+#!/bin/bash
+LAUNCHER
+    printf '%s\n' "$MARKER"
+    cat <<'LAUNCHER'
+# Installed by ai-aligned-chrome: adds --use-mock-keychain and
+# --password-store=basic when --user-data-dir is a throwaway (temp) profile, so
+# this test browser never raises a "Chromium Safe Storage" keychain prompt.
+# Undo with `ai-aligned-chrome unwrap`.
+self="${BASH_SOURCE[0]}"
+while [ -L "$self" ]; do
+    link="$(readlink "$self")"
+    case "$link" in /*) self="$link" ;; *) self="$(dirname "$self")/$link" ;; esac
+done
+real="$(cd "$(dirname "$self")" && pwd -P)/.$(basename "$self").real"
+
+inject=0
+if [ -z "${AI_ALIGNED_CHROME_DISABLE:-}" ]; then
+    dir=""; mock=0
+    for a in "$@"; do
+        case "$a" in
+            --use-mock-keychain|-use-mock-keychain) mock=1 ;;
+            --user-data-dir=*|-user-data-dir=*) dir="${a#*=}" ;;
+        esac
+    done
+    case "$dir" in ""|/*) ;; *) dir="$PWD/$dir" ;; esac
+    tmp="${TMPDIR:-/tmp}"; tmp="${tmp%/}"
+    if [ "$mock" = 0 ] && [ -n "$dir" ]; then
+        case "$dir" in
+            /tmp/*|/private/tmp/*|/var/folders/*|/private/var/folders/*|"$tmp"/*) inject=1 ;;
+        esac
+    fi
+fi
+
+if [ "$inject" = 1 ]; then
+    exec -a "$0" "$real" --use-mock-keychain --password-store=basic "$@"
+fi
+exec -a "$0" "$real" "$@"
+LAUNCHER
+}
+
+# --- bundle inspection -------------------------------------------------------
+
+plist_get() { /usr/bin/plutil -extract "$2" raw -o - "$1/Contents/Info.plist" 2>/dev/null; }
+
+is_test_browser() {
+    local id
+    [ -f "$1/Contents/Info.plist" ] || return 1
+    id="$(plist_get "$1" CFBundleIdentifier)" || return 1
+    case " $BUNDLE_IDS " in *" $id "*) return 0 ;; esac
+    return 1
+}
+
+exe_of() {
+    local name
+    name="$(plist_get "$1" CFBundleExecutable)" || return 1
+    [ -n "$name" ] || return 1
+    printf '%s/Contents/MacOS/%s\n' "$1" "$name"
+}
+
+is_macho() {
+    local magic
+    magic="$(head -c 4 "$1" 2>/dev/null | od -An -tx1 | tr -d ' \n')"
+    case "$magic" in cffaedfe|cefaedfe|cafebabe|bebafeca|feedfacf|feedface) return 0 ;; esac
+    return 1
+}
+
+is_wrapped() {
+    local exe
+    exe="$(exe_of "$1")" || return 1
+    [ -f "$(dirname "$exe")/.$(basename "$exe").real" ] && head -c 4096 "$exe" 2>/dev/null | grep -q '^# ai-aligned-chrome launcher'
+}
+
+# Cheap check that needs no plist parsing, for the watcher's hot loop: an
+# aside copy exists and the executable next to it is still our launcher (an
+# unzipper that renames its output into place last would have replaced it).
+looks_wrapped() {
+    local f name
+    for f in "$1/Contents/MacOS/".*.real; do
+        [ -e "$f" ] || continue
+        name="${f##*/.}"; name="${name%.real}"
+        head -c 200 "$1/Contents/MacOS/$name" 2>/dev/null | grep -q '^# ai-aligned-chrome launcher' && return 0
+    done
+    return 1
+}
+
+# Recently changed executables may still be mid-extraction; leave them for the
+# next pass rather than renaming a file an unzipper still has open by path.
+# ctime, not mtime: ditto and unzip restore the archive's mtime, which is old.
+settled() {
+    local now m
+    now="$(date +%s)"
+    m="$(stat -f %c "$1" 2>/dev/null)" || return 1
+    [ $((now - m)) -ge "${AI_ALIGNED_CHROME_SETTLE:-0}" ]
+}
+
+# Every Chromium-style .app under the roots, not descending into bundles.
+find_apps() {
+    local r
+    while IFS= read -r r; do
+        [ -d "$r" ] || continue
+        find "$r" -maxdepth 5 -name '*.app' -type d -prune -print 2>/dev/null
+    done < <(roots)
+}
+
+# --- wrap / unwrap -----------------------------------------------------------
+
+wrap_one() {
+    local app="$1" exe real tmp current
+    is_test_browser "$app" || { err "not a test browser, skipping: $app"; return 1; }
+    exe="$(exe_of "$app")" || { err "no CFBundleExecutable: $app"; return 1; }
+    real="$(dirname "$exe")/.$(basename "$exe").real"
+
+    if is_wrapped "$app"; then
+        # Refresh launchers from older versions in place.
+        if head -c 4096 "$exe" | grep -qxF "$MARKER"; then return 2; fi
+        tmp="$(mktemp "$(dirname "$exe")/.aac.XXXXXX")" || return 1
+        launcher >"$tmp" && chmod 0755 "$tmp" && mv -f "$tmp" "$exe" || { rm -f "$tmp"; return 1; }
+        log "refreshed $app"
+        return 0
+    fi
+
+    [ -f "$exe" ] || return 1
+    is_macho "$exe" || { err "executable is neither Mach-O nor our launcher, leaving it: $exe"; return 1; }
+    settled "$exe" || return 3
+
+    # Hard-link the original aside first, then atomically rename the launcher
+    # over the executable: there is no moment at which the path is missing.
+    tmp="$(mktemp "$(dirname "$exe")/.aac.XXXXXX")" || return 1
+    if ! launcher >"$tmp" || ! chmod 0755 "$tmp"; then rm -f "$tmp"; return 1; fi
+    rm -f "$real"
+    if ! ln "$exe" "$real" 2>/dev/null && ! cp -p "$exe" "$real"; then rm -f "$tmp"; return 1; fi
+    if ! mv -f "$tmp" "$exe"; then rm -f "$tmp" "$real"; return 1; fi
+    current="$(plist_get "$app" CFBundleShortVersionString)"
+    log "wrapped $app (${current:-?})"
+    return 0
+}
+
+unwrap_one() {
+    local app="$1" exe real
+    exe="$(exe_of "$app")" || return 1
+    real="$(dirname "$exe")/.$(basename "$exe").real"
+    is_wrapped "$app" || return 2
+    mv -f "$real" "$exe" || return 1
+    log "unwrapped $app"
+    return 0
+}
+
+apps_from_args() {
+    if [ "$#" -gt 0 ]; then
+        local a
+        for a in "$@"; do
+            a="${a%/}"
+            case "$a" in
+                *.app) printf '%s\n' "$a" ;;
+                *.app/*) printf '%s\n' "${a%%.app/*}.app" ;;
+                *) err "not an .app bundle: $a" ;;
+            esac
+        done
+    else
+        find_apps
+    fi
+}
+
+cmd_wrap() {
+    local quiet=0 app rc n=0 pending=0
+    [ "${1:-}" = "--quiet" ] && { quiet=1; shift; }
+    while IFS= read -r app; do
+        [ -n "$app" ] || continue
+        # Fast path for the watcher: an aside-copy means it is already wrapped.
+        if [ "$quiet" = 1 ] && [ "$#" -eq 0 ] && looks_wrapped "$app"; then continue; fi
+        if [ "$#" -eq 0 ] && ! is_test_browser "$app"; then continue; fi
+        wrap_one "$app"; rc=$?
+        case "$rc" in
+            0) n=$((n + 1)); [ "$quiet" = 1 ] || say "wrapped   $app" ;;
+            2) [ "$quiet" = 1 ] || say "ok        $app" ;;
+            3) pending=$((pending + 1)); [ "$quiet" = 1 ] || say "pending   $app (still being written)" ;;
+            *) [ "$quiet" = 1 ] || say "FAILED    $app" ;;
+        esac
+    done < <(apps_from_args "$@")
+    if [ "$quiet" = 0 ]; then
+        if [ "$pending" -gt 0 ]; then say "$n newly wrapped, $pending pending"; else say "$n newly wrapped"; fi
+    fi
+    return 0
+}
+
+cmd_unwrap() {
+    local app rc
+    while IFS= read -r app; do
+        [ -n "$app" ] || continue
+        unwrap_one "$app"; rc=$?
+        case "$rc" in
+            0) say "unwrapped $app" ;;
+            2) ;;
+            *) say "FAILED    $app" ;;
+        esac
+    done < <(apps_from_args "$@")
+}
+
+cmd_status() {
+    local app ver any=0
+    while IFS= read -r app; do
+        is_test_browser "$app" || continue
+        any=1
+        ver="$(plist_get "$app" CFBundleShortVersionString)"
+        if is_wrapped "$app"; then
+            printf 'wrapped    %-16s %s\n' "${ver:-?}" "$app"
+        else
+            printf 'UNWRAPPED  %-16s %s\n' "${ver:-?}" "$app"
+        fi
+    done < <(find_apps)
+    [ "$any" = 1 ] || say "no test browsers found under: $(roots | tr '\n' ' ')"
+}
+
+# --- watching ----------------------------------------------------------------
+
+# A small FSEvents client, compiled on first use, so the watcher costs nothing
+# while no browser is being downloaded. Without swiftc it falls back to
+# polling.
+fsevents_source() {
+    cat <<'SWIFT'
+import CoreServices
+import Foundation
+
+// aac-fsevents ROOT...: prints one line per coalesced batch of file-system
+// events under any ROOT. Watches the nearest existing ancestor of each root,
+// so roots that do not exist yet are picked up when they are created.
+setvbuf(stdout, nil, _IOLBF, 0)
+// FSEvents reports real paths (/private/var/...), so resolve symlinks in the
+// part of each root that exists and keep the rest as given.
+func realRoot(_ p: String) -> String {
+    var head = URL(fileURLWithPath: p).standardizedFileURL
+    var tail: [String] = []
+    while !FileManager.default.fileExists(atPath: head.path) && head.path != "/" {
+        tail.insert(head.lastPathComponent, at: 0); head.deleteLastPathComponent()
+    }
+    // realpath(3), not resolvingSymlinksInPath, which maps /private/var back to /var.
+    guard let r = realpath(head.path, nil) else { return p }
+    var real = URL(fileURLWithPath: String(cString: r)); free(r)
+    for c in tail { real.appendPathComponent(c) }
+    return real.path
+}
+let roots = CommandLine.arguments.dropFirst().map(realRoot)
+if roots.isEmpty { FileHandle.standardError.write("usage: aac-fsevents ROOT...\n".data(using: .utf8)!); exit(64) }
+func existingAncestor(_ p: String) -> String {
+    var url = URL(fileURLWithPath: p)
+    while !FileManager.default.fileExists(atPath: url.path) && url.path != "/" { url.deleteLastPathComponent() }
+    return url.path
+}
+let watched = Array(Set(roots.map(existingAncestor)))
+let prefixes = roots.map { $0.hasSuffix("/") ? $0 : $0 + "/" }
+let callback: FSEventStreamCallback = { _, _, count, paths, _, _ in
+    let list = unsafeBitCast(paths, to: NSArray.self) as! [String]
+    for p in list.prefix(count) {
+        let q = p.hasSuffix("/") ? p : p + "/"
+        if prefixes.contains(where: { q.hasPrefix($0) || $0.hasPrefix(q) }) { print(p); return }
+    }
+}
+guard let stream = FSEventStreamCreate(nil, callback, nil, watched as CFArray,
+    FSEventStreamEventId(kFSEventStreamEventIdSinceNow), 0.25,
+    FSEventStreamCreateFlags(kFSEventStreamCreateFlagFileEvents | kFSEventStreamCreateFlagUseCFTypes | kFSEventStreamCreateFlagNoDefer)) else { exit(1) }
+FSEventStreamSetDispatchQueue(stream, DispatchQueue.main)
+FSEventStreamStart(stream)
+print("ready")  // events before this were missed; the caller rescans on it
+dispatchMain()
+SWIFT
+}
+
+helper() {
+    local bin="$STATE/bin/aac-fsevents" src="$STATE/bin/aac-fsevents.swift" swiftc
+    mkdir -p "$STATE/bin" || return 1
+    if [ -x "$bin" ] && [ -f "$src" ] && fsevents_source | cmp -s - "$src"; then
+        printf '%s\n' "$bin"; return 0
+    fi
+    swiftc="$(command -v swiftc 2>/dev/null || true)"
+    [ -x /usr/bin/swiftc ] && swiftc=/usr/bin/swiftc
+    [ -n "$swiftc" ] || return 1
+    # swiftc goes by the extension, so the staging copy must end in .swift.
+    fsevents_source >"$src.new.swift" || return 1
+    "$swiftc" -O -o "$bin.new" "$src.new.swift" >>"$STATE/agent.log" 2>&1 || { rm -f "$src.new.swift" "$bin.new"; return 1; }
+    mv -f "$bin.new" "$bin" && mv -f "$src.new.swift" "$src" || return 1
+    printf '%s\n' "$bin"
+}
+
+# Scans on every coalesced batch of events under the roots (at most ~4 a
+# second, and only while something is being written there), so a browser is
+# wrapped while it is still being unpacked, before its first launch. A full
+# scan also runs after 60 s without events, as a safety net.
+cmd_watch() {
+    local bin r line
+    local -a dirs=()
+    while IFS= read -r r; do dirs+=("$r"); done < <(roots)
+    cmd_wrap --quiet
+    if [ -z "${AI_ALIGNED_CHROME_POLL:-}" ] && bin="$(helper)"; then
+        local fifo hp
+        fifo="$(mktemp -u "$STATE/watch.XXXXXX")" && mkfifo "$fifo" || return 1
+        "$bin" "${dirs[@]}" >"$fifo" & hp=$!
+        # The helper would outlive us otherwise: nothing writes to it until
+        # the next event, so it would not even get SIGPIPE.
+        trap 'kill "$hp" 2>/dev/null; rm -f "$fifo"' EXIT
+        trap 'exit 143' TERM INT HUP
+        log "watch started (pid $$, fsevents helper $hp)"
+        while IFS= read -r -t 60 line || [ $? -gt 128 ]; do
+            [ "$line" = ready ] && log "watch ready"
+            cmd_wrap --quiet
+        done <"$fifo"
+        log "watch: fsevents helper exited"
+        return 1
+    fi
+    local tick="${AI_ALIGNED_CHROME_INTERVAL:-2}"
+    log "watch started (pid $$, polling every ${tick}s)"
+    while :; do
+        sleep "$tick"
+        cmd_wrap --quiet
+    done
+}
+
+# --- attribution -------------------------------------------------------------
+
+# Walks a live pid's ancestry and prints it, plus the cwd of the nearest
+# non-Chrome ancestor, which is usually the worktree of whoever launched it.
+ancestry() {
+    local p="$1" depth=0 cmd cwd shown=0
+    while [ -n "$p" ] && [ "$p" -gt 1 ] && [ "$depth" -lt 8 ]; do
+        cmd="$(ps -o command= -p "$p" 2>/dev/null | cut -c1-160)"
+        [ -n "$cmd" ] || break
+        printf '      %6s %s\n' "$p" "$cmd"
+        if [ "$shown" = 0 ] && [ "$depth" -gt 0 ]; then
+            cwd="$(lsof -a -p "$p" -d cwd -Fn 2>/dev/null | sed -n 's/^n//p' | head -1)"
+            [ -n "$cwd" ] && { printf '             cwd: %s\n' "$cwd"; shown=1; }
+        fi
+        p="$(ps -o ppid= -p "$p" 2>/dev/null | tr -d ' ')"
+        depth=$((depth + 1))
+    done
+}
+
+cmd_prompts() {
+    local last="24h" lines line ts app pid count=0
+    while [ "$#" -gt 0 ]; do
+        case "$1" in
+            --last) last="$2"; shift 2 ;;
+            --last=*) last="${1#--last=}"; shift ;;
+            *) err "unknown option: $1"; return 64 ;;
+        esac
+    done
+    lines="$(/usr/bin/log show --last "$last" --style compact \
+        --predicate 'process == "securityd" AND eventMessage CONTAINS "displaying keychain prompt for"' 2>/dev/null \
+        | grep -E 'Chrome for Testing\.app|Chromium\.app')"
+    if [ -z "$lines" ]; then
+        say "no keychain prompts from test browsers in the last $last"
+        return 0
+    fi
+    while IFS= read -r line; do
+        ts="$(printf '%s' "$line" | cut -c1-19)"
+        app="$(printf '%s' "$line" | sed -E 's/.*displaying keychain prompt for (.*\.app)\(([0-9]+)\).*/\1/')"
+        pid="$(printf '%s' "$line" | sed -E 's/.*displaying keychain prompt for .*\.app\(([0-9]+)\).*/\1/')"
+        count=$((count + 1))
+        say "$ts  pid $pid  $app"
+        if ps -p "$pid" >/dev/null 2>&1; then ancestry "$pid"; fi
+    done <<<"$lines"
+    say ""
+    say "$count prompt(s) from test browsers in the last $last"
+}
+
+# --- LaunchAgent -------------------------------------------------------------
+
+self_path() {
+    local p="${BASH_SOURCE[0]}"
+    case "$p" in /*) ;; *) p="$PWD/$p" ;; esac
+    printf '%s\n' "$p"
+}
+
+cmd_agent() {
+    case "${1:-status}" in
+        install)
+            local bin; bin="$(self_path)"
+            mkdir -p "$(dirname "$PLIST")" "$STATE"
+            cat >"$PLIST" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$LABEL</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/bin/bash</string>
+        <string>$bin</string>
+        <string>watch</string>
+    </array>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ProcessType</key><string>Background</string>
+    <key>LowPriorityIO</key><true/>
+    <key>Nice</key><integer>10</integer>
+    <key>StandardOutPath</key><string>$STATE/agent.log</string>
+    <key>StandardErrorPath</key><string>$STATE/agent.log</string>
+</dict>
+</plist>
+EOF
+            launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+            launchctl bootstrap "gui/$(id -u)" "$PLIST" || { err "launchctl bootstrap failed"; return 1; }
+            say "LaunchAgent $LABEL installed and running ($bin watch)"
+            ;;
+        uninstall)
+            launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null
+            rm -f "$PLIST"
+            say "LaunchAgent $LABEL removed"
+            ;;
+        status)
+            if launchctl print "gui/$(id -u)/$LABEL" >/dev/null 2>&1; then
+                local pid
+                pid="$(launchctl print "gui/$(id -u)/$LABEL" 2>/dev/null | awk '/^\tpid = /{print $3}')"
+                say "running${pid:+ (pid $pid)}"
+            else
+                say "not loaded"; return 1
+            fi
+            ;;
+        *) err "usage: ai-aligned-chrome agent install|uninstall|status"; return 64 ;;
+    esac
+}
+
+cmd_doctor() {
+    local problems=0 unwrapped
+    say "ai-aligned-chrome v$VERSION"
+    say "roots:"; roots | sed 's/^/  /'
+    if cmd_agent status >/dev/null 2>&1; then
+        say "✓ LaunchAgent: $(cmd_agent status)"
+    else
+        say "✗ LaunchAgent not loaded; new downloads will not be wrapped (run: ai-aligned-chrome agent install)"
+        problems=1
+    fi
+    unwrapped="$(cmd_status | grep -c '^UNWRAPPED')"
+    if [ "$unwrapped" -gt 0 ]; then
+        say "✗ $unwrapped test browser(s) not wrapped (run: ai-aligned-chrome wrap)"
+        problems=1
+    else
+        say "✓ every test browser under the roots is wrapped"
+    fi
+    say ""
+    cmd_prompts --last 1h
+    return "$problems"
+}
+
+usage() { sed -n '/^# Usage:/,/^# *AI_ALIGNED_CHROME_DISABLE/p' "$(self_path)" | sed 's/^# \{0,1\}//'; }
+
+main() {
+    [ "$(uname -s)" = "Darwin" ] || { err "macOS only"; exit 69; }
+    local cmd="${1:-help}"; shift 2>/dev/null
+    case "$cmd" in
+        wrap)     cmd_wrap "$@" ;;
+        unwrap)   cmd_unwrap "$@" ;;
+        status)   cmd_status "$@" ;;
+        prompts)  cmd_prompts "$@" ;;
+        watch)    cmd_watch "$@" ;;
+        agent)    cmd_agent "$@" ;;
+        doctor)   cmd_doctor "$@" ;;
+        launcher) launcher ;;
+        version|--version) say "ai-aligned-chrome v$VERSION" ;;
+        help|-h|--help) usage ;;
+        *) err "unknown command: $cmd"; usage >&2; exit 64 ;;
+    esac
+}
+
+main "$@"

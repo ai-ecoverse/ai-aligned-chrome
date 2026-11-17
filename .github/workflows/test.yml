@@ -1,0 +1,16 @@
+name: Test
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+jobs:
+  test:
+    # Bundles, FSEvents and the keychain are macOS-only.
+    runs-on: macos-latest
+    steps:
+    - uses: actions/checkout@v6
+    - name: Run tests
+      run: ./test.sh
