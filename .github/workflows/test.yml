@@ -11,6 +11,6 @@ jobs:
     # Bundles, FSEvents and the keychain are macOS-only.
     runs-on: macos-latest
     steps:
-    - uses: actions/checkout@v6
+    - uses: actions/checkout@v7
     - name: Run tests
       run: ./test.sh
